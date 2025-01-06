@@ -11,6 +11,8 @@
 
 #include "am.names.h"
 
+#define EXIT_TUNING_MODE_MS 5000
+
 #define TURN_PIN GPIO_NUM_33
 #define ENC_BTN_PIN GPIO_NUM_35
 #define ENC_DAT_PIN GPIO_NUM_37
@@ -36,19 +38,14 @@ GyverOLED<SSD1306_128x32, OLED_BUFFER> oled;
 
 #define PRODUCT true
 
-SemaphoreHandle_t sem;
-static portMUX_TYPE spin_lock = portMUX_INITIALIZER_UNLOCKED;
-TaskHandle_t clickHandlerTask;
-TaskHandle_t rotateHandlerTask;
-
 // мастер живой и отдает команды
 volatile bool master_alive = false;
 
 typedef struct
 {
-    uint16_t val; // текущее значение настройки
-    uint16_t min; // нижняя граница настроек
-    uint16_t max; // верхняя граница настроек
+    int16_t val; // текущее значение настройки
+    int16_t min; // нижняя граница настроек
+    int16_t max; // верхняя граница настроек
     uint8_t x;    // позиция на экране по Х (pixels)
     uint8_t y;    // позиция на экране по Y (pixels)
 } param_t;
@@ -98,13 +95,24 @@ xQueueHandle recv_queue;
 void read_sensors_values(void *parameter);
 void showStatic();
 void showInfo(const char *info);
+void showSensorParams(uint8_t index, bool active);
 void showState();
 void OnDataRecv(uint8_t *mac, uint8_t *msg_data, uint8_t len);
+
+bool in_selecting_mode = false;
+bool in_setting_mode = false;
+int tuning_param_index = 0;
+ulong last_action_time = 0;
+
+#pragma region Encoder functions
+static portMUX_TYPE locker = portMUX_INITIALIZER_UNLOCKED;
+TaskHandle_t clickHandlerTask;
+TaskHandle_t rotateHandlerTask;
 
 void IRAM_ATTR onEncoderClick()
 {
     BaseType_t woken = pdFALSE;
-    portENTER_CRITICAL_ISR(&spin_lock);
+    portENTER_CRITICAL_ISR(&locker);
 
     vTaskNotifyGiveFromISR(clickHandlerTask, &woken);
     if (woken)
@@ -112,13 +120,13 @@ void IRAM_ATTR onEncoderClick()
         portYIELD_FROM_ISR(woken);
     }
 
-    portEXIT_CRITICAL_ISR(&spin_lock);
+    portEXIT_CRITICAL_ISR(&locker);
 }
 
 void IRAM_ATTR onEncoderRotate()
 {
     BaseType_t woken = pdFALSE;
-    portENTER_CRITICAL_ISR(&spin_lock);
+    portENTER_CRITICAL_ISR(&locker);
 
     vTaskNotifyGiveFromISR(rotateHandlerTask, &woken);
     if (woken)
@@ -126,7 +134,7 @@ void IRAM_ATTR onEncoderRotate()
         portYIELD_FROM_ISR(woken);
     }
 
-    portEXIT_CRITICAL_ISR(&spin_lock);
+    portEXIT_CRITICAL_ISR(&locker);
 }
 
 void handleEncoderClick(void *param)
@@ -137,8 +145,51 @@ void handleEncoderClick(void *param)
         vTaskDelay(20 / portTICK_PERIOD_MS);
         if (digitalRead(ENC_BTN_PIN) == LOW)
         {
+            last_action_time = millis();
+            if (in_selecting_mode)
+            {
+                in_setting_mode = !in_setting_mode;
+            }
+            else
+            {
+                in_selecting_mode = true;
+            }
+
             Serial.println("clicked!");
+            Serial.print("setting mode = ");
+            Serial.println(in_setting_mode);
         }
+    }
+}
+
+void change_param_index(bool doInc)
+{
+    showSensorParams(tuning_param_index, false);
+
+    tuning_param_index += doInc ? 1 : -1;
+
+    if (tuning_param_index > CHANNEL_INDEX)
+    {
+        tuning_param_index = AIR_INDEX_MIN;
+    }
+    if (tuning_param_index < AIR_INDEX_MIN)
+    {
+        tuning_param_index = CHANNEL_INDEX;
+    }
+
+    showSensorParams(tuning_param_index, true);
+}
+
+void change_settings(bool doInc)
+{
+    params[tuning_param_index].val += doInc ? 1 : -1;
+    if (params[tuning_param_index].val < params[tuning_param_index].min)
+    {
+        params[tuning_param_index].val = params[tuning_param_index].min;
+    }
+    if (params[tuning_param_index].val > params[tuning_param_index].max)
+    {
+        params[tuning_param_index].val = params[tuning_param_index].max;
     }
 }
 
@@ -152,6 +203,67 @@ void handleEncoderRotate(void *param)
     {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        last_action_time = millis();
+        in_selecting_mode = true;
+        // digitalRead хорошо бы заменить чем-нибудь более быстрым
+        curState = digitalRead(ENC_CLK_PIN) | digitalRead(ENC_DAT_PIN) << 1;
+        if (resetFlag && curState == 0b11)
+        {
+            if (prevState == 0b10)
+            {
+                if (in_setting_mode)
+                {
+                    change_settings(false);
+                }
+                else
+                {
+                    change_param_index(false);
+                }
+
+                encCounter--;
+            }
+
+            if (prevState == 0b01)
+            {
+                if (in_setting_mode)
+                {
+                    change_settings(true);
+                }
+                else
+                {
+                    change_param_index(true);
+                }
+                encCounter++;
+            }
+
+            resetFlag = 0;
+            flag = true;
+
+            showSensorParams(tuning_param_index, true);
+            oled.update();
+        }
+        if (curState == 0b00)
+        {
+            resetFlag = 1;
+        }
+        prevState = curState;
+
+        if (flag)
+        {
+            Serial.println(encCounter);
+            flag = false;
+        }
+    }
+}
+
+void handleEncoderRotateOk(void *param)
+{
+    while (true)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        last_action_time = millis();
+        in_selecting_mode = true;
         // digitalRead хорошо бы заменить чем-нибудь более быстрым
         curState = digitalRead(ENC_CLK_PIN) | digitalRead(ENC_DAT_PIN) << 1;
         if (resetFlag && curState == 0b11)
@@ -174,22 +286,9 @@ void handleEncoderRotate(void *param)
             Serial.println(encCounter);
             flag = false;
         }
-
-        // vTaskDelay(10 / portTICK_PERIOD_MS);
-        // if (digitalRead(ENC_DAT_PIN) == LOW)
-        // {
-        //     Serial.print("rotate");
-        //     if (digitalRead(ENC_CLK_PIN) == LOW)
-        //     {
-        //         Serial.println(" as clock");
-        //     }
-        //     else
-        //     {
-        //         Serial.println(" anti clock");
-        //     }
-        // }
     }
 }
+#pragma endregion
 
 void setup()
 {
@@ -286,30 +385,14 @@ void setup()
 
 void loop()
 {
-    // sensors_event_t event;
-
-    // if (false)
-    // {
-    //     dht.temperature().getEvent(&event);
-    //     if (!isnan(event.temperature))
-    //     {
-    //         tin = event.temperature;
-    //     }
-
-    //     dht.humidity().getEvent(&event);
-    //     if (!isnan(event.relative_humidity))
-    //     {
-    //         hin = event.relative_humidity;
-    //     }
-
-    //     flo_sensors.requestTemperatures(); // считывание значение температуры
-    //     tfl = flo_sensors.getTempCByIndex(0);
-    //     // tfl = flo_sensors.getTempC(ThermometerAddr); // температура в градусах Цельсия
-
-    //     showStates(tin, hin, tfl);
-    // }
-
-    vTaskDelay(1000);
+    ulong cur_time = millis();
+    if (cur_time - last_action_time > EXIT_TUNING_MODE_MS)
+    {
+        in_selecting_mode = false;
+        showSensorParams(tuning_param_index, false);
+        oled.update();
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
 
 void sendSensorValue(uint8_t sensor_id, int16_t sensor_value)
@@ -412,11 +495,24 @@ void showLabels()
     oled.print("КАН ");
 }
 
-void showSensorParams(uint8_t index)
+void showSensorParams(uint8_t index, bool active = false)
 {
     param_t sp = params[index];
     oled.setCursorXY(sp.x, sp.y);
-    oled.print(sp.val);
+    bool less10 = sp.val < 10;
+    if (active)
+    {
+        oled.invertText(active);
+        if(less10) oled.print(" ");
+        oled.print(sp.val);
+        oled.invertText(false);
+        oled.update();
+    }
+    else
+    {
+        if(less10) oled.print(" ");
+        oled.print(sp.val);
+    }
 }
 
 void showParams()
